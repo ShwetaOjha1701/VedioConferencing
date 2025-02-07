@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Conferencing with Chatbot</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.3.2/dist/peerjs.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        #video-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        video {
+            width: 300px;
+            height: 200px;
+            border: 2px solid black;
+        }
+
+        #chat-container {
+            width: 100%;
+            max-width: 600px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin-top: 20px;
+        }
+
+        #messages {
+            height: 200px;
+            overflow-y: scroll;
+            border: 1px solid #ccc;
+            padding: 5px;
+            margin-bottom: 10px;
+        }
+
+        #message-form {
+            display: flex;
+        }
+
+        #message-form input {
+            flex: 1;
+            padding: 5px;
+        }
+
+        #message-form button {
+            padding: 5px 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Video Conferencing with Chatbot</h1>
+    <button id="createRoom">Create Room</button>
+    <input type="text" id="usernameInput" placeholder="Enter Your Name" />
+
+    <input type="text" id="roomIdInput" placeholder="Enter Room ID" />
+    <button id="joinRoom">Join Room</button>
+    <button id="disconnectCall" style="display: none;">Disconnect</button>
+
+    <div id="joineduserid"> </div><br>
+    <!-- <div id="video-grid"></div> -->
+    <div id="video-grid" style="display: flex; flex-wrap: wrap;"></div>
+
+    <button id="toggleCamera" style="display: none;">Turn Off Camera</button>
+    <button id="toggleMic" style="display: none;">Turn Off Mic</button>
+    <button id="shareScreen" style="display: none;">Share Screen</button>
+    <button id="startRecording" style="display: none;">Start Recording</button>
+    <button id="stopRecording" style="display: none;">Stop Recording</button>
+
+
+    <div id="chat-container">
+        <h2>Chat</h2>
+        <div id="messages"></div>
+        <form id="message-form">
+            <input type="text" id="messageInput" placeholder="Type a message..." autocomplete="off" />
+            <button type="submit">Send</button>
+        </form>
+
+    </div>
+
+    <script>
+        const socket = io('/');
+        const videoGrid = document.getElementById('video-grid');
+        const messages = document.getElementById('messages');
+        const messageForm = document.getElementById('message-form');
+        const messageInput = document.getElementById('messageInput');
+        const myVideo = document.createElement('video');
+        myVideo.muted = true;
+        const peers = {};
+        let roomId, peer, localStream;
+        let joineduserid;
+        let connectedUsers = {}; // Track all connected usernames
+        let username = ''; // Store the user's name
+
+        let isCameraOn = true;
+        let isMicOn = true;
+        let mediaRecorder;
+        let recordedChunks = [];
+
+        document.getElementById('startRecording').addEventListener('click', () => {
+            if (localStream) {
+                mediaRecorder = new MediaRecorder(localStream);
+
+                mediaRecorder.ondataavailable = event => {
+                    if (event.data.size > 0) {
+                        recordedChunks.push(event.data);
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'recording.webm';
+                    a.click();
+                    recordedChunks = [];
+                };
+
+                mediaRecorder.start();
+                console.log("Recording started");
+
+                document.getElementById('startRecording').style.display = 'none';
+                document.getElementById('stopRecording').style.display = 'inline';
+            } else {
+                console.error("No local stream available for recording");
+            }
+        });
+
+        document.getElementById('stopRecording').addEventListener('click', () => {
+            if (mediaRecorder) {
+                mediaRecorder.stop();
+                console.log("Recording stopped");
+
+                document.getElementById('startRecording').style.display = 'inline';
+                document.getElementById('stopRecording').style.display = 'none';
+            }
+        });
+
+
+        let isScreenSharing = false;
+        let originalStream = null;
+
+        document.getElementById('shareScreen').addEventListener('click', async () => {
+            if (!isScreenSharing) {
+                try {
+                    const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                    const screenTrack = screenStream.getVideoTracks()[0];
+                    isScreenSharing = true;
+
+                    // Replace the video track for all peers
+                    for (let userId in peers) {
+                        const sender = peers[userId].peerConnection.getSenders().find(s => s.track.kind === 'video');
+                        if (sender) sender.replaceTrack(screenTrack);
+                    }
+
+                    console.log("Screen sharing started");
+                    socket.emit('screen-sharing', { roomId, userId: peer.id });
+
+                    // When screen sharing stops
+                    screenTrack.onended = stopScreenSharing;
+                } catch (error) {
+                    console.error("Error sharing screen:", error);
+                }
+            }
+        });
+
+        // function stopScreenSharing() {
+        //     if (isScreenSharing) {
+        //         console.log("Screen sharing stopped");
+
+        //         // Restore the original camera stream
+        //         for (let userId in peers) {
+        //             const sender = peers[userId].peerConnection.getSenders().find(s => s.track.kind === 'video');
+        //             if (sender) sender.replaceTrack(originalStream);
+        //         }
+
+        //         isScreenSharing = false;
+        //         socket.emit('stop-screen-sharing', { roomId, userId: peer.id });
+        //     }
+        // }
+
+        socket.on('screen-sharing', ({ userId }) => {
+            console.log(`User ${userId} started sharing their screen.`);
+
+            // Handle showing the shared screen for other users if needed
+            // (e.g., replace their video element with the shared screen stream)
+        });
+socket.on('stop-screen-sharing', async ({ userId }) => {
+    console.log(`User ${userId} stopped sharing their screen.`);
+    
+    // Get the video element for the user
+    const videoElement = document.getElementById(`video-${userId}`);
+    
+    if (videoElement) {
+        // Optional: Stop the current screen-sharing stream if still active
+        const screenStream = videoElement.srcObject;
+        if (screenStream) {
+            screenStream.getTracks().forEach(track => track.stop());
+        }
+        
+        // Revert to the original camera stream
+        const originalCameraStream = await getUserCameraStream(userId); // Replace this with your method to fetch the user's camera stream
+        videoElement.srcObject = originalCameraStream;
+    } else {
+        console.warn(`No video element found for user ${userId}`);
+    }
+});
+
+// Example of how you might fetch the original camera stream
+async function getUserCameraStream(userId) {
+    // Fetch or re-enable the camera stream for the user
+    return navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+}
+
+
+        // socket.on('screen-sharing', ({ userId }) => {
+        //     console.log(`User ${userId} started sharing their screen.`);
+        //     // Handle showing the shared screen for other users if needed.
+        // });
+
+        function stopScreenSharing() {
+            if (isScreenSharing) {
+                console.log("Screen sharing stopped");
+
+                // Restore the original camera stream
+                for (let userId in peers) {
+                    const sender = peers[userId].peerConnection.getSenders().find(s => s.track.kind === 'video');
+                    if (sender) sender.replaceTrack(originalStream);
+                }
+
+                isScreenSharing = false;
+                socket.emit('stop-screen-sharing', { roomId, userId: peer.id });
+            }
+        }
+
+
+        document.getElementById('toggleCamera').addEventListener('click', () => {
+            if (localStream) {
+                const videoTrack = localStream.getVideoTracks()[0]; // Get the video track
+                isCameraOn = !isCameraOn; // Toggle the camera state
+                videoTrack.enabled = isCameraOn; // Enable or disable the video track
+
+                // Change the button text accordingly
+                document.getElementById('toggleCamera').textContent = isCameraOn ? 'Turn Off Camera' : 'Turn On Camera';
+            } else {
+                console.log("No local stream available to toggle camera");
+            }
+        });
+
+        document.getElementById('toggleMic').addEventListener('click', () => {
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0]; // Get the audio track
+                isMicOn = !isMicOn; // Toggle the mic state
+                audioTrack.enabled = isMicOn; // Enable or disable the audio track
+
+                // Change the button text accordingly
+                document.getElementById('toggleMic').textContent = isMicOn ? 'Turn Off Mic' : 'Turn On Mic';
+            } else {
+                console.log("No local stream available to toggle microphone");
+            }
+        });
+
+        document.getElementById('createRoom').addEventListener('click', () => {
+            roomId = uuidv4();
+            document.getElementById('roomIdInput').value = roomId;
+        });
+
+        document.getElementById('joinRoom').addEventListener('click', () => {
+            roomId = document.getElementById('roomIdInput').value;
+            username = document.getElementById('usernameInput').value || 'Anonymous'; // Default to 'Anonymous' if no name provided
+
+            if (!roomId) {
+                alert('Please enter or create a Room ID');
+                return;
+            }
+            initializePeerConnection();
+            document.getElementById('disconnectCall').style.display = 'inline';
+            document.getElementById('toggleMic').style.display = 'inline';
+            document.getElementById('toggleCamera').style.display = 'inline';
+            document.getElementById('shareScreen').style.display = 'inline';
+            document.getElementById('shareScreen').style.display = 'inline';
+            document.getElementById('startRecording').style.display = 'inline';
+
+        });
+
+        function initializePeerConnection() {
+
+
+            if (!peer) {
+                peer = new Peer(undefined, { debug: 2 });
+            }
+            peer.on('open', id => {
+                console.log(id, "SOCKETID");
+
+                socket.emit('join-room', roomId, id, username);
+                startVideoChat();
+
+            });
+        }
+
+        function startVideoChat() {
+            // Listen for the message that indicates a user joining the room
+            // socket.on('user-joined-message', (message) => {
+            //     console.log(message); // Log the message for debugging
+
+            //     // Display the message on the page
+            //     const messageContainer = document.getElementById('message-container');
+            //     const messageElement = document.createElement('p');
+            //     messageElement.textContent = message;  // Set the message as text
+            //     messageContainer.appendChild(messageElement);  // Append to the container
+            // });
+            navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+                .then(stream => {
+                    stream.username = username;
+                    localStream = stream;
+                    addVideoStream(myVideo, stream, username); // Show self video with username
+                    document.getElementById('joineduserid').textContent = `Your User ID: ${stream.id}`;
+                    document.getElementById('toggleCamera').textContent = 'Turn Off Camera';
+                    document.getElementById('toggleMic').textContent = 'Turn Off Mic';
+
+                    socket.on('user-connected', (userId, username) => {
+
+
+                        console.log('New user connected:', username);
+                        connectedUsers[userId] = username; // Store the connected user's name by userId
+                        console.log('Connected users:', connectedUsers); // Check if connected users are stored correctly
+                        connectToNewUser(userId, stream, username);  // Connect to the new user (start the peer connection)
+
+                        // updateConnectedUsersList();
+                        // }
+                    });
+
+                    peer.on('call', call => {
+                        console.log('Incoming call from:', call.peer);
+                        call.answer(stream); // Answer with local stream
+
+                        const video = document.createElement('video');
+                        call.on('stream', userVideoStream => {
+                            const callerUsername = connectedUsers[call.peer] || 'Unknown User';
+                            console.log('Adding video for:', callerUsername);
+                            addVideoStream(video, userVideoStream, callerUsername); // Add video for the new user
+                        });
+
+                        call.on('close', () => {
+                            video.remove();
+                            console.log('Call with', call.peer, 'closed');
+                        });
+                    });
+                })
+                .catch(err => console.error("Error accessing camera/microphone:", err));
+
+            console.log('User connected:', username);
+
+        }
+        // socket.on('user-disconnected', userId => {
+        //     if (peers[userId]) peers[userId].close();
+        // });
+        socket.on('user-disconnected', (userId) => {
+            console.log(`User ${userId} disconnected.`);
+            if (peers[userId]) {
+                peers[userId].close();  // Close the peer connection
+                delete peers[userId];   // Remove from peers list
+            }
+            removeVideo(userId);  // Remove the video element for this user
+        });
+
+        // socket.on('user-disconnected', userId => {
+        //     if (peers[userId]) {
+        //         peers[userId].close();  // Close the peer connection
+        //         delete peers[userId];   // Remove from peers list
+        //     }
+        //     console.log(User ${userId} disconnected);
+        // });
+
+
+        let isHost = false;
+
+        socket.on('host-assigned', newHostId => {
+            console.log('New host:', newHostId);
+            if (peer.id === newHostId) {
+                isHost = true;
+                alert('You are now the host.');
+            } else {
+                isHost = false;
+            }
+        });
+        
+        
+        function removeVideo(userId) {
+            const videoWrapper = document.getElementById(userId);  // Find the video wrapper by userId
+            if (videoWrapper) {
+                console.log(`Removing video for user ${userId}`);
+                videoWrapper.remove();  // Remove the entire wrapper (video + label)
+            } else {
+                console.log(`No video found for user ${userId}`);
+            }
+        }
+   
+        function connectToNewUser(userId, stream, username) {
+            const call = peer.call(userId, stream, { metadata: { username } });
+            const video = document.createElement('video');
+            call.on('stream', userVideoStream => {
+                addVideoStream(video, userVideoStream, username);
+            });
+            call.on('close', () => {
+                video.remove();
+            });
+            peers[userId] = call;
+        }
+
+        function addVideoStream(video, stream, username) {
+            const existingVideo = document.getElementById(stream.id);
+            if (existingVideo) return;  // Prevent adding the same video twice
+
+            video.srcObject = stream;
+            video.addEventListener('loadedmetadata', () => video.play());
+
+            const videoWrapper = document.createElement('div');
+            videoWrapper.id = stream.id;  // Assign the unique ID for easy removal
+            videoWrapper.style.position = 'relative';
+            videoWrapper.style.margin = '10px';
+            videoWrapper.style.width = '200px';
+
+            const label = document.createElement('div');
+            label.textContent = stream.id
+            label.style.position = 'absolute';
+            label.style.bottom = '5px';
+            label.style.left = '5px';
+            label.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+            label.style.color = 'white';
+            label.style.padding = '2px 5px';
+            label.style.borderRadius = '3px';
+
+            videoWrapper.appendChild(video);
+            videoWrapper.appendChild(label);
+            videoGrid.appendChild(videoWrapper);
+        }
+
+        function uuidv4() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+
+        // Disconnect Button
+        
+        document.getElementById('disconnectCall').addEventListener('click', () => {
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());  // Stop all media tracks
+            }
+            console.log(localStream.id, "perrriddd");
+
+            removeVideo(localStream.id);  // Remove the local user's video and label
+
+            if (peer) {
+                peer.destroy();  // Close PeerJS connection
+            }
+            socket.emit('leave-room', roomId, localStream.id);  // Notify others
+            clearVideoGrid(localStream.id);  // Clear the video grid
+
+            document.getElementById('disconnectCall').style.display = 'none';
+        });
+
+       
+        // Disconnect button to allow the current user to leave
+        // document.getElementById('disconnectCall').addEventListener('click', () => {
+        //     socket.disconnect();
+        //     peer.destroy();
+        //            socket.emit('leave-room', roomId);  // Notify others
+        //             clearVideoGrid();
+        //     alert('You have left the room.');
+        // });
+
+        function clearVideoGrid(id) {
+
+            // let element= document.getElementById(id)
+            // element.remove();
+            videoGrid.innerHTML = '';  // Remove all video elements
+            // videoGrid.lable = ''
+        }
+
+        // Chat functionality
+        messageForm.addEventListener('submit', e => {
+            e.preventDefault();
+            const message = messageInput.value;
+            if (message) {
+                socket.emit('chat-message', { roomId, message });
+                addMessage(`You: ${message}`);
+                messageInput.value = '';
+            }
+        });
+
+        socket.on('chat-message', ({ userId, message }) => {
+            addMessage(`${userId}: ${message}`);
+        });
+
+        function addMessage(text) {
+            const messageElement = document.createElement('div');
+            messageElement.textContent = text;
+            messages.append(messageElement);
+            messages.scrollTop = messages.scrollHeight;
+        }
+   
+   </script>
+</body>
+
+</html>
